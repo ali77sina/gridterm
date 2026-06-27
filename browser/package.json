@@ -1,0 +1,13 @@
+{
+  "name": "gridterm-browser-broker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-process browser broker for gridterm: one persistent Chrome, one page per panel agent, shared logins.",
+  "main": "broker.mjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@playwright/mcp": "^0.0.76",
+    "playwright-core": "^1.61.1"
+  }
+}

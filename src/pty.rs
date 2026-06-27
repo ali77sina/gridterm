@@ -144,9 +144,20 @@ impl PtyTerm {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let mut term = term_reader.lock();
-                        parser.advance(&mut *term, &buf[..n]);
-                        drop(term);
+                        // Parse in small chunks, releasing the Term lock between
+                        // each, so a big output burst never holds the lock for
+                        // long. This keeps the UI thread's try_lock in snapshot()
+                        // from being starved (the "freeze on heavy pane" fix).
+                        let mut off = 0;
+                        const CHUNK: usize = 4096;
+                        while off < n {
+                            let end = (off + CHUNK).min(n);
+                            {
+                                let mut term = term_reader.lock();
+                                parser.advance(&mut *term, &buf[off..end]);
+                            }
+                            off = end;
+                        }
                         proxy_reader.mark_dirty();
                         // Wake the UI event loop; it throttles to the display
                         // refresh, so bursts don't cause redundant frames.
@@ -202,11 +213,38 @@ impl PtyTerm {
 
     /// Capture everything needed to render this pane in one lock acquisition:
     /// styled text runs, the cursor cell, and the per-row selection spans.
-    pub fn snapshot(&self) -> Snapshot {
+    ///
+    /// Returns `None` if the pane's reader thread is currently holding the Term
+    /// lock (e.g. parsing a large output burst). The UI thread must NEVER block
+    /// on this lock: a long burst could otherwise stall rendering for seconds
+    /// (the "come back and it freezes" bug). When `None`, the renderer simply
+    /// reuses the previous frame for this pane.
+    pub fn snapshot(&self) -> Option<Snapshot> {
         use alacritty_terminal::term::cell::Flags;
         use std::hash::{Hash, Hasher};
 
-        let term = self.term.lock();
+        // Try to grab the lock without blocking. Spin very briefly so trivial
+        // contention (the common case) still succeeds, but give up fast if the
+        // reader is mid-burst rather than queueing behind a fair lock for
+        // seconds.
+        let term = {
+            let mut guard = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+            loop {
+                if let Some(g) = self.term.try_lock_unfair() {
+                    guard = Some(g);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            match guard {
+                Some(g) => g,
+                None => return None,
+            }
+        };
         let grid = term.grid();
         let cols = grid.columns();
         let display_offset = grid.display_offset() as i32;
@@ -339,7 +377,7 @@ impl PtyTerm {
             }
         }
 
-        Snapshot {
+        Some(Snapshot {
             rows,
             cursor,
             cursor_shape_block: !matches!(
@@ -351,7 +389,7 @@ impl PtyTerm {
             scroll_offset,
             total_lines,
             screen_lines: screen,
-        }
+        })
     }
 
     /// Begin a simple text selection at a viewport cell.

@@ -47,6 +47,33 @@ impl ChatState {
         }
     }
 
+    /// The most recent assistant message text, for Cmd+C copy.
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.role == Role::Assistant)
+            .map(|e| e.text.clone())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The full visible transcript (user + assistant + tool lines), for copying
+    /// the whole conversation.
+    pub fn transcript_text(&self) -> String {
+        self.entries
+            .iter()
+            .map(|e| {
+                let tag = match e.role {
+                    Role::User => "You",
+                    Role::Assistant => "AI",
+                    Role::Tool => "tool",
+                };
+                format!("{tag}: {}", e.text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Append streamed text to the current assistant entry (or start one).
     pub fn push_assistant_token(&mut self, t: &str) {
         self.stick_bottom = true;

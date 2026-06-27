@@ -132,8 +132,27 @@ impl Heartbeat {
             .name("gridterm-watchdog".into())
             .spawn(move || {
                 let mut warned_at = 0u64;
+                let mut last_tick = Instant::now();
                 loop {
                     std::thread::sleep(Duration::from_millis(500));
+                    // Detect process suspension (macOS App Nap / sleep while
+                    // backgrounded): if our own 500ms sleep actually took much
+                    // longer, the whole process was frozen by the OS, not the UI
+                    // thread. Skip this round so we don't log a false FREEZE
+                    // (the "it says froze but I was fine" case).
+                    let tick_elapsed = last_tick.elapsed();
+                    last_tick = Instant::now();
+                    if tick_elapsed > Duration::from_millis(1500) {
+                        // Re-baseline: treat current processing (if any) as fresh
+                        // so a suspension gap isn't attributed to a UI stall.
+                        let cur = proc_since.load(Ordering::Relaxed);
+                        if cur != 0 {
+                            let now = start.elapsed().as_millis() as u64;
+                            proc_since.store(now.max(1), Ordering::Relaxed);
+                        }
+                        warned_at = 0;
+                        continue;
+                    }
                     let since = proc_since.load(Ordering::Relaxed);
                     if since == 0 {
                         continue; // idle, healthy
@@ -183,6 +202,7 @@ mod tests {
 
     #[test]
     fn append_writes_to_log() {
+        let _g = crate::test_env_lock().lock().unwrap();
         append("TEST", "hello from test");
         let contents = std::fs::read_to_string(log_path()).unwrap_or_default();
         assert!(contents.contains("TEST"), "log missing TEST block");
@@ -191,6 +211,7 @@ mod tests {
 
     #[test]
     fn watchdog_flags_long_processing() {
+        let _g = crate::test_env_lock().lock().unwrap();
         let hb = Heartbeat::new();
         hb.spawn_watchdog(Duration::from_millis(300));
         hb.begin();

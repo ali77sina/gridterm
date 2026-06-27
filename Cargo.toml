@@ -3,6 +3,17 @@ name = "gridterm"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "gridterm"
+path = "src/main.rs"
+
+# Featherweight per-panel MCP endpoint: pipes the agent's stdio MCP stream to
+# the single browser broker over a Unix socket. No Node, no heavy deps, ~tiny
+# resident memory, so a full grid of panel agents costs almost nothing.
+[[bin]]
+name = "gridterm-browser-shim"
+path = "src/bin/browser_shim.rs"
+
 [dependencies]
 winit = "0.30"
 wgpu = "29.0"
@@ -18,7 +29,7 @@ ureq = { version = "2", features = ["tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
-tungstenite = "0.24"
+png = "0.18"
 
 [profile.release]
 opt-level = 3

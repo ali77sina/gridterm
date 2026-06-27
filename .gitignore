@@ -3,3 +3,6 @@
 gridterm.toml
 .mcp.json
 .playwright-mcp/
+HANDOFF.md
+browser/node_modules/
+browser/package-lock.json

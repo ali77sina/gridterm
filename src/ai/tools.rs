@@ -155,7 +155,7 @@ pub fn tool_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "browser_setup",
-                "description": "Configure browser access for the coding agents. 'on' = each agent gets its own isolated browser session, all sharing the saved logins (headless, lazy, low-RAM). 'off' = disable. On by default.",
+                "description": "Configure browser access for the coding agents. 'on' = every panel agent gets its OWN tab in one shared Chrome that keeps your logins (sign in once, shared across all panels; tabs are isolated like two browser tabs). 'off' = disable. On by default.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -163,6 +163,28 @@ pub fn tool_schema() -> Value {
                     },
                     "required": ["mode"]
                 }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_open",
+                "description": "Open a URL in the shared logged-in browser and return the page's title and visible text. Use this to actually look at a website yourself: check if the user is signed in somewhere, read a page, verify a web app, etc. The browser keeps the user's logins, so authenticated pages work. If the site needs a login the user hasn't done yet, the page text will show a sign-in screen; then call browser_request_login.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "The URL to open (include https://)." }
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_read",
+                "description": "Re-read the current page in the shared browser (title + visible text) without navigating. Use after a login or an action to see the updated page.",
+                "parameters": { "type": "object", "properties": {} }
             }
         },
         {
@@ -182,7 +204,7 @@ pub fn tool_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "browser_save_login",
-                "description": "Call this AFTER the user confirms they have logged in (following browser_request_login). It captures the logged-in session and shares it with all agents (each keeps an isolated session but inherits the credentials), so they can browse authenticated sites headlessly afterward.",
+                "description": "Call this AFTER the user confirms they have logged in (following browser_request_login). With the shared persistent Chrome the login is already saved automatically; this confirms the session is live, reports the cookie count, and hides the browser window again. All panels share the session.",
                 "parameters": { "type": "object", "properties": {} }
             }
         }
@@ -214,9 +236,13 @@ grep them, and react to what the agents are doing.\n\
 - You can reshape the grid: use add_pane to add a terminal without disturbing existing ones, or set_grid \
 to grow the layout (safe). NEVER shrink the grid (which closes terminals and kills their processes) unless \
 the user explicitly asks to close panes — and only then with allow_close=true.\n\
-- The agents share ONE persistent Chrome that keeps your logins like a normal browser — sign in once, it \
-stays signed in across runs. So agents can test/navigate web apps behind login (your apps, Gmail, AWS). \
-Manage with browser_setup (on/off).\n\
+- You have a shared logged-in browser. Use browser_open(url) to actually open a page and read \
+its text yourself (check if the user is signed into a site, read a web app, verify something). \
+browser_read re-reads the current page. The browser keeps the user's logins like a normal Chrome \
+(sign in once, stays signed in), and panel agents share it too (each gets its own tab). If a page \
+shows a sign-in screen, call browser_request_login (with the URL) to pop the window for the user \
+to sign in once; then continue. browser_save_login just confirms the session. Manage with \
+browser_setup (on/off).\n\
 - If a browser action is blocked by a LOGIN: call browser_request_login (with the URL) to open the \
 browser; tell the user to sign in. They stay signed in afterward (persistent profile), so you can \
 continue. browser_save_login just confirms the session.\n\

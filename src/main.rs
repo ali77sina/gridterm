@@ -8,6 +8,14 @@ mod pty;
 mod renderer;
 mod usage;
 
+/// A process-wide lock used ONLY by tests that mutate global env (HOME, cwd) so
+/// they don't race each other or env-reading code (e.g. crashlog).
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +30,7 @@ use winit::window::{Window, WindowId};
 
 use ai::{spawn_agent, AgentInput, AiConfig, AiEvent, ToolCall};
 use ai_ui::{tool_summary, ChatState, Role};
-use grid::{GridLayout, Rect};
+use grid::{Divider, GridLayout, Rect};
 use pty::{PtyTerm, Waker};
 use renderer::{PaneDraw, QuadInstance, Renderer};
 
@@ -94,6 +102,11 @@ struct App {
     otlp_port: Option<u16>,
     /// Heartbeat the watchdog monitors to detect UI freezes.
     heartbeat: Option<crashlog::Heartbeat>,
+    /// Set when a pane's snapshot was skipped this frame (reader held the lock);
+    /// schedules one more redraw shortly so the pane catches up without blocking.
+    needs_followup_redraw: bool,
+    /// Active grid divider drag (resizing panes), if any.
+    dragging_divider: Option<Divider>,
 }
 
 impl App {
@@ -134,6 +147,8 @@ impl App {
             usage: usage::UsageStore::new(),
             otlp_port: None,
             heartbeat: None,
+            needs_followup_redraw: false,
+            dragging_divider: None,
         }
     }
 
@@ -182,6 +197,36 @@ impl App {
             (w * 0.4).clamp(360.0, 560.0)
         } else {
             0.0
+        }
+    }
+
+    /// The pixel area the terminal grid occupies (window minus the chat panel).
+    fn pane_area_size(&self) -> (f32, f32) {
+        let (w, h) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.size())
+            .unwrap_or((1100.0, 720.0));
+        (w - self.chat_panel_width(), h)
+    }
+
+    /// Resize every pane's PTY to match the current layout rects (after a grid
+    /// divider drag changes track sizes).
+    fn resize_panes_to_layout(&mut self) {
+        let (win_w, win_h) = self.pane_area_size();
+        let (cell_w, cell_h) = self
+            .renderer
+            .as_ref()
+            .map(|r| (r.cell_w, r.cell_h))
+            .unwrap_or((8.0, 16.0));
+        for i in 0..self.panes.len() {
+            let rect = self.layout.rect_for(i, win_w, win_h);
+            let cols = (rect.w / cell_w).floor().max(1.0) as usize;
+            let rows = (rect.h / cell_h).floor().max(1.0) as usize;
+            if let Some(pane) = self.panes.get_mut(i) {
+                pane.term.resize(cols, rows, cell_w, cell_h);
+                pane.text_dirty = true;
+            }
         }
     }
 
@@ -397,6 +442,15 @@ terminal(s). If the user explicitly wants to close panes, call again with allow_
                     Err(e) => format!("failed: {e}"),
                 }
             }
+            "browser_open" => {
+                let url = args["url"].as_str().unwrap_or("");
+                if url.is_empty() {
+                    "error: no url provided".into()
+                } else {
+                    browser::browser_open(url)
+                }
+            }
+            "browser_read" => browser::browser_read(),
             "browser_request_login" => {
                 let url = args["url"].as_str();
                 browser::surface_for_login(url)
@@ -410,13 +464,14 @@ terminal(s). If the user explicitly wants to close panes, call again with allow_
     fn build_context(&self) -> String {
         let mut out = String::new();
         for (i, pane) in self.panes.iter().enumerate() {
-            let snap = pane.term.snapshot();
             let mut text = String::new();
-            for row in &snap.rows {
-                for run in &row.runs {
-                    text.push_str(&run.text);
+            if let Some(snap) = pane.term.snapshot() {
+                for row in &snap.rows {
+                    for run in &row.runs {
+                        text.push_str(&run.text);
+                    }
+                    text.push('\n');
                 }
-                text.push('\n');
             }
             let text = ai::tools::truncate_tokens(text.trim_end(), 500);
             out.push_str(&format!(
@@ -571,92 +626,104 @@ terminal(s). If the user explicitly wants to close panes, call again with allow_
             // Only re-shape the text when the visible content actually changed.
             // The content hash catches the no-op case (idle/background panes),
             // and mouse selection just adds quads, so dragging stays cheap.
-            if pane.text_dirty && snap.content_hash != pane.last_hash {
-                renderer.set_pane_rows(&mut pane.buffer, &snap.rows);
-                pane.last_hash = snap.content_hash;
-            }
-            pane.text_dirty = false;
-
-            // Per-cell background color quads (only for non-default backgrounds).
-            for (ri, row) in snap.rows.iter().enumerate() {
-                let y = rect.y + ri as f32 * cell_h;
-                if y + cell_h < rect.y || y > rect.y + rect.h {
-                    continue;
+            //
+            // `snap` is None when the reader thread holds the Term lock (large
+            // output burst). In that case we DON'T block: we keep last frame's
+            // shaped buffer and skip the snapshot-derived overlays for this pane,
+            // then redraw fully on a later frame. This is what prevents the
+            // multi-second UI freeze on heavy panes.
+            if let Some(snap) = snap {
+                if pane.text_dirty && snap.content_hash != pane.last_hash {
+                    renderer.set_pane_rows(&mut pane.buffer, &snap.rows);
+                    pane.last_hash = snap.content_hash;
                 }
-                for run in &row.runs {
-                    if run.bg == color::DEFAULT_BG {
+                pane.text_dirty = false;
+
+                // Per-cell background color quads (only for non-default backgrounds).
+                for (ri, row) in snap.rows.iter().enumerate() {
+                    let y = rect.y + ri as f32 * cell_h;
+                    if y + cell_h < rect.y || y > rect.y + rect.h {
                         continue;
                     }
-                    let cells = run.text.chars().count() as f32;
-                    let x = rect.x + run.col_start as f32 * cell_w;
+                    for run in &row.runs {
+                        if run.bg == color::DEFAULT_BG {
+                            continue;
+                        }
+                        let cells = run.text.chars().count() as f32;
+                        let x = rect.x + run.col_start as f32 * cell_w;
+                        quads.push(QuadInstance {
+                            rect: [x, y, cells * cell_w, cell_h],
+                            color: [
+                                run.bg.r as f32 / 255.0,
+                                run.bg.g as f32 / 255.0,
+                                run.bg.b as f32 / 255.0,
+                                1.0,
+                            ],
+                        });
+                    }
+                }
+
+                // Selection highlight quads (drawn first, behind text).
+                for (row, scol, ecol) in &snap.selection_spans {
+                    let x = rect.x + *scol as f32 * cell_w;
+                    let y = rect.y + *row as f32 * cell_h;
+                    let w = (*ecol as f32 - *scol as f32 + 1.0) * cell_w;
                     quads.push(QuadInstance {
-                        rect: [x, y, cells * cell_w, cell_h],
-                        color: [
-                            run.bg.r as f32 / 255.0,
-                            run.bg.g as f32 / 255.0,
-                            run.bg.b as f32 / 255.0,
-                            1.0,
-                        ],
+                        rect: [x, y, w, cell_h],
+                        color: [0.25, 0.40, 0.75, 0.55],
                     });
                 }
-            }
 
-            // Selection highlight quads (drawn first, behind text).
-            for (row, scol, ecol) in &snap.selection_spans {
-                let x = rect.x + *scol as f32 * cell_w;
-                let y = rect.y + *row as f32 * cell_h;
-                let w = (*ecol as f32 - *scol as f32 + 1.0) * cell_w;
-                quads.push(QuadInstance {
-                    rect: [x, y, w, cell_h],
-                    color: [0.25, 0.40, 0.75, 0.55],
-                });
-            }
+                // Cursor quad. Solid block when active, hollow-ish dim when not.
+                // Use the measured glyph offset/height so it sits on the text.
+                if let Some((col, row)) = snap.cursor {
+                    if snap.cursor_shape_block {
+                        let x = rect.x + col as f32 * cell_w;
+                        let y = rect.y + row as f32 * cell_h + cursor_top;
+                        let color = if active {
+                            [0.85, 0.85, 0.85, 0.9]
+                        } else {
+                            [0.5, 0.5, 0.5, 0.5]
+                        };
+                        quads.push(QuadInstance {
+                            rect: [x, y, cell_w, cursor_height],
+                            color,
+                        });
+                    }
+                }
 
-            // Cursor quad. Solid block when active, hollow-ish dim when not.
-            // Use the measured glyph offset/height so it sits on the text.
-            if let Some((col, row)) = snap.cursor {
-                if snap.cursor_shape_block {
-                    let x = rect.x + col as f32 * cell_w;
-                    let y = rect.y + row as f32 * cell_h + cursor_top;
-                    let color = if active {
-                        [0.85, 0.85, 0.85, 0.9]
-                    } else {
-                        [0.5, 0.5, 0.5, 0.5]
-                    };
+                // Slick auto-hiding scrollbar: only when there's scrollback. Thin,
+                // overlaid on the right edge (takes no layout space). Brighter when
+                // scrolled up, dim when at the live bottom.
+                if snap.total_lines > snap.screen_lines {
+                    let sb_w = 3.0;
+                    let sb_x = rect.x + rect.w - sb_w - 2.0;
+                    let track_h = rect.h - 4.0;
+                    let track_y = rect.y + 2.0;
+                    let total = snap.total_lines as f32;
+                    let visible = snap.screen_lines as f32;
+                    let thumb_h = (visible / total * track_h).max(18.0).min(track_h);
+                    // offset 0 = bottom; map to thumb position from the top.
+                    let max_off = (snap.total_lines - snap.screen_lines).max(1) as f32;
+                    let frac_from_bottom = snap.scroll_offset as f32 / max_off;
+                    let thumb_y = track_y + (track_h - thumb_h) * (1.0 - frac_from_bottom);
+                    let scrolled = snap.scroll_offset > 0;
+                    // Track (very subtle).
                     quads.push(QuadInstance {
-                        rect: [x, y, cell_w, cursor_height],
-                        color,
+                        rect: [sb_x, track_y, sb_w, track_h],
+                        color: [1.0, 1.0, 1.0, 0.05],
+                    });
+                    // Thumb.
+                    let a = if scrolled { 0.55 } else { 0.22 };
+                    quads.push(QuadInstance {
+                        rect: [sb_x, thumb_y, sb_w, thumb_h],
+                        color: [0.7, 0.75, 0.85, a],
                     });
                 }
-            }
-
-            // Slick auto-hiding scrollbar: only when there's scrollback. Thin,
-            // overlaid on the right edge (takes no layout space). Brighter when
-            // scrolled up, dim when at the live bottom.
-            if snap.total_lines > snap.screen_lines {
-                let sb_w = 3.0;
-                let sb_x = rect.x + rect.w - sb_w - 2.0;
-                let track_h = rect.h - 4.0;
-                let track_y = rect.y + 2.0;
-                let total = snap.total_lines as f32;
-                let visible = snap.screen_lines as f32;
-                let thumb_h = (visible / total * track_h).max(18.0).min(track_h);
-                // offset 0 = bottom; map to thumb position from the top.
-                let max_off = (snap.total_lines - snap.screen_lines).max(1) as f32;
-                let frac_from_bottom = snap.scroll_offset as f32 / max_off;
-                let thumb_y = track_y + (track_h - thumb_h) * (1.0 - frac_from_bottom);
-                let scrolled = snap.scroll_offset > 0;
-                // Track (very subtle).
-                quads.push(QuadInstance {
-                    rect: [sb_x, track_y, sb_w, track_h],
-                    color: [1.0, 1.0, 1.0, 0.05],
-                });
-                // Thumb.
-                let a = if scrolled { 0.55 } else { 0.22 };
-                quads.push(QuadInstance {
-                    rect: [sb_x, thumb_y, sb_w, thumb_h],
-                    color: [0.7, 0.75, 0.85, a],
-                });
+            } else {
+                // Reader is mid-burst; keep this pane dirty so we re-shape it on
+                // a subsequent frame once the lock is free.
+                self.needs_followup_redraw = true;
             }
 
             draws.push(PaneDraw {
@@ -855,15 +922,54 @@ terminal(s). If the user explicitly wants to close panes, call again with allow_
     }
 
     fn paste(&mut self) {
-        let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok());
-        if let Some(text) = text {
-            if let Some(pane) = self.panes.get_mut(self.active) {
-                // Bracketed paste so the shell treats it as literal input.
-                pane.term.write(b"\x1b[200~");
-                pane.term.write(text.as_bytes());
-                pane.term.write(b"\x1b[201~");
+        // Text paste (the common case): bracketed paste so the shell treats it
+        // as literal input.
+        if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+            if !text.is_empty() {
+                if let Some(pane) = self.panes.get_mut(self.active) {
+                    pane.term.write(b"\x1b[200~");
+                    pane.term.write(text.as_bytes());
+                    pane.term.write(b"\x1b[201~");
+                }
+                return;
             }
         }
+        // No text: maybe an image (e.g. a screenshot). macOS puts RAW image data
+        // on the clipboard, which a terminal can't paste. Claude Code / Codex
+        // accept an image by FILE PATH, so we save it to a temp PNG and paste the
+        // path. This makes "screenshot then paste into the agent" just work.
+        if let Some(path) = self.clipboard_image_to_file() {
+            if let Some(pane) = self.panes.get_mut(self.active) {
+                pane.term.write(b"\x1b[200~");
+                pane.term.write(path.as_bytes());
+                pane.term.write(b" \x1b[201~");
+            }
+        }
+    }
+
+    /// If the clipboard holds an image, write it to a temp PNG and return the
+    /// path. Returns None if there's no image. Files go to a stable per-user dir
+    /// and are named by content time so they don't collide.
+    fn clipboard_image_to_file(&mut self) -> Option<String> {
+        let img = self.clipboard.as_mut()?.get_image().ok()?;
+        let dir = std::env::temp_dir().join("gridterm-pastes");
+        let _ = std::fs::create_dir_all(&dir);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("paste-{stamp}.png"));
+
+        let file = std::fs::File::create(&path).ok()?;
+        let w = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(w, img.width as u32, img.height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        // arboard gives RGBA8 bytes, exactly what the PNG encoder expects.
+        writer.write_image_data(&img.bytes).ok()?;
+        writer.finish().ok()?;
+        Some(path.to_string_lossy().into_owned())
     }
 
     fn handle_key(&mut self, key: &Key, text: Option<&str>) {
@@ -984,6 +1090,24 @@ terminal(s). If the user explicitly wants to close panes, call again with allow_
                                     {
                                         self.chat.insert(&t);
                                         self.request_redraw();
+                                    }
+                                    return;
+                                }
+                                // Cmd+C copies the AI's last reply; Cmd+Shift+C
+                                // copies the whole transcript. (Previously Cmd+C
+                                // was swallowed here, so copy did nothing in chat.)
+                                "c" => {
+                                    let text = if shift {
+                                        Some(self.chat.transcript_text())
+                                    } else {
+                                        self.chat.last_assistant_text()
+                                    };
+                                    if let Some(text) = text {
+                                        if !text.is_empty() {
+                                            if let Some(cb) = self.clipboard.as_mut() {
+                                                let _ = cb.set_text(text);
+                                            }
+                                        }
                                     }
                                     return;
                                 }
@@ -1163,11 +1287,13 @@ impl ApplicationHandler<Wake> for App {
         // each pane's agent can be pointed at it via env vars.
         self.otlp_port = usage::collector::start(self.usage.clone());
 
-        // Pre-configure a headless browser MCP so coding agents in panes can
-        // test web apps with zero setup. Non-destructive merge into .mcp.json.
+        // Pre-configure the brokered browser MCP so coding agents in panes can
+        // drive one shared, logged-in Chrome (each gets its own tab) with zero
+        // setup. Non-destructive merge into .mcp.json; broker starts lazily in
+        // the background so the UI never blocks on first-run install.
         match browser::ensure_default() {
-            Ok(true) => crashlog::append("BROWSER_MCP", "added headless playwright MCP"),
-            Ok(false) => {}
+            Ok(true) => crashlog::append("BROWSER_MCP", "configured brokered browser MCP"),
+            Ok(false) => browser::spawn_broker_bringup(),
             Err(e) => crashlog::append("BROWSER_MCP_ERR", &format!("{e}")),
         }
 
@@ -1211,6 +1337,16 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;
+                // Dragging a grid divider? Resize the tracks live.
+                if let Some(div) = self.dragging_divider {
+                    let (paw, pah) = self.pane_area_size();
+                    self.layout
+                        .drag_divider(div, position.x as f32, position.y as f32, paw, pah);
+                    // Re-fit PTYs continuously so text reflows as you drag.
+                    self.resize_panes_to_layout();
+                    self.request_redraw();
+                    return;
+                }
                 let cell = self.mouse_to_cell(position);
                 let update = match (self.dragging.as_mut(), cell) {
                     (Some(drag), Some((i, col, row, side))) => {
@@ -1304,8 +1440,18 @@ impl ApplicationHandler<Wake> for App {
                                 self.request_redraw();
                                 return;
                             }
-                            // Otherwise: terminal pane selection (and unfocus chat).
+                            // Otherwise: a grid divider (resize) or pane selection.
                             self.chat.input_focused = false;
+                            // Resize handle? Check the gutters between panes.
+                            let (paw, pah) = self.pane_area_size();
+                            let mx = self.mouse_pos.x as f32;
+                            let my = self.mouse_pos.y as f32;
+                            if let Some(div) =
+                                self.layout.divider_at(mx, my, paw, pah, 6.0)
+                            {
+                                self.dragging_divider = Some(div);
+                                return;
+                            }
                             if let Some((i, col, row, side)) = self.mouse_to_cell(self.mouse_pos) {
                                 self.active = i;
                                 if let Some(pane) = self.panes.get(i) {
@@ -1320,6 +1466,11 @@ impl ApplicationHandler<Wake> for App {
                         }
                         ElementState::Released => {
                             self.dragging = None;
+                            if self.dragging_divider.take().is_some() {
+                                // Finalize: re-fit PTYs to the new track sizes.
+                                self.resize_panes_to_layout();
+                                self.request_redraw();
+                            }
                             // Keep the selection so Cmd+C can copy it.
                         }
                     }
@@ -1390,6 +1541,21 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // If a pane's snapshot was skipped this frame (reader was mid-burst),
+        // schedule a catch-up redraw a few ms later so it re-shapes once the
+        // lock frees, without ever having blocked.
+        if self.needs_followup_redraw {
+            self.needs_followup_redraw = false;
+            for pane in &mut self.panes {
+                pane.text_dirty = true;
+            }
+            if !self.pending_redraw {
+                let wake_at = Instant::now() + Duration::from_millis(16);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
+                self.deferred_redraw = true;
+                return;
+            }
+        }
         if self.deferred_redraw && !self.pending_redraw {
             let min_interval = Duration::from_micros(8000);
             let since = self.last_frame.elapsed();

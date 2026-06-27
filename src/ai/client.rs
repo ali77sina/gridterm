@@ -236,7 +236,18 @@ pub enum AgentInput {
 /// private shell, never the user's panes), so blocking work (sleep, polling a
 /// command) never freezes the UI.
 fn is_local_tool(name: &str) -> bool {
-    matches!(name, "shell" | "shell_bg" | "read_shell" | "wait")
+    matches!(
+        name,
+        "shell"
+            | "shell_bg"
+            | "read_shell"
+            | "wait"
+            | "browser_open"
+            | "browser_read"
+            | "browser_request_login"
+            | "browser_save_login"
+            | "browser_setup"
+    )
 }
 
 /// Spawn the agent loop on a background thread. It owns the conversation,
@@ -322,6 +333,33 @@ fn execute_local_tool(
             match ai_shell {
                 Some(sh) => crate::ai::tools::truncate_tokens(&sh.scrollback_text(lines), 1500),
                 None => "(ai shell unavailable)".into(),
+            }
+        }
+        // Browser tools talk to the broker; they may block for a navigation, so
+        // running them here (agent thread) keeps the UI responsive.
+        "browser_open" => {
+            let url = args["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                "error: no url provided".into()
+            } else {
+                crate::ai::tools::truncate_tokens(&crate::browser::browser_open(url), 2000)
+            }
+        }
+        "browser_read" => {
+            crate::ai::tools::truncate_tokens(&crate::browser::browser_read(), 2000)
+        }
+        "browser_request_login" => {
+            crate::browser::surface_for_login(args["url"].as_str())
+        }
+        "browser_save_login" => crate::browser::save_login_state(),
+        "browser_setup" => {
+            let mode = match args["mode"].as_str().unwrap_or("on") {
+                "off" => crate::browser::BrowserMode::Off,
+                _ => crate::browser::BrowserMode::Shared,
+            };
+            match crate::browser::set_mode(mode) {
+                Ok(msg) => msg,
+                Err(e) => format!("failed: {e}"),
             }
         }
         _ => return None,
